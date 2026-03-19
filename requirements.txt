@@ -1,0 +1,35 @@
+# ============================================================
+# Agentic Talent Intelligence Platform - Requirements
+# ============================================================
+
+# --- Core Web Framework (Backend) ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+
+# --- LangChain & LLM ---
+langchain==0.2.6
+langchain-openai==0.1.13
+langchain-google-genai==1.0.7
+langchain-community==0.2.6
+openai==1.35.3
+google-generativeai==0.7.1
+
+# --- Vector Database ---
+chromadb==0.5.3
+
+# --- PDF Parsing ---
+PyPDF2==3.0.1
+pdfminer.six==20221105
+
+# --- Data & Utilities ---
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.7.4
+
+# --- Data Science ---
+numpy==1.26.4
+pandas==2.2.2
+
+# --- Dev/Testing ---
+httpx==0.27.0
