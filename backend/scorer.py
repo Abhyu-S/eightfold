@@ -64,14 +64,17 @@ def _normalize_skill(skill: str) -> str:
 
 
 def _compute_verification_ratio(
+    jd_emb: np.ndarray,
     claimed_skills: list[str],
     verified_skills_sources: list[str],
 ) -> tuple[float, list[str], list[str]]:
     """
-    Compute skill verification ratio.
+    Compute skill verification ratio, weighted by relevance to the JD.
+    Irrelevant skills are excluded from the penalty out-of-100 score.
 
     Parameters
     ----------
+    jd_emb : The embedding of the job description.
     claimed_skills : skills listed on the resume
     verified_skills_sources : skills found in GitHub deps / code files
 
@@ -79,31 +82,75 @@ def _compute_verification_ratio(
     -------
     (ratio, verified_list, unverified_list)
     """
+    from backend.embeddings import embed_texts, cosine_similarity as cs, sklearn_cosine_similarity
+    
     if not claimed_skills:
         return 0.0, [], []
 
     claimed_normalized = {_normalize_skill(s): s for s in claimed_skills}
     verified_normalized = {_normalize_skill(s) for s in verified_skills_sources}
 
-    verified = []
-    unverified = []
-
+    # Identify which claimed skills are actually verified
+    verified_flags = {}
     for norm, original in claimed_normalized.items():
         if norm in verified_normalized:
-            verified.append(original)
+            verified_flags[original] = True
         else:
             # Fuzzy: check if the core of the skill name is in any verified dep
             found = False
             for vn in verified_normalized:
                 if norm in vn or vn in norm:
-                    verified.append(original)
+                    verified_flags[original] = True
                     found = True
                     break
             if not found:
-                unverified.append(original)
+                verified_flags[original] = False
 
-    ratio = len(verified) / len(claimed_normalized) if claimed_normalized else 0.0
-    return ratio, sorted(verified), sorted(unverified)
+    # Get relevance weights by embedding all unique claimed and comparing against JD
+    unique_claimed = list(verified_flags.keys())
+    skill_embs = embed_texts(unique_claimed)
+    
+    jd = jd_emb.reshape(1, -1)
+    if skill_embs.ndim == 1:
+        skill_embs = skill_embs.reshape(1, -1)
+        
+    sims = sklearn_cosine_similarity(jd, skill_embs)[0]
+    
+    # We dynamically filter or weight the skills.
+    # To drop completely irrelevant skills from being scored out of 100, we apply a threshold.
+    # Anything below 0.58 similarity to the JD is generally considered completely disconnected,
+    # or anything wildly below the max similarity observed for this particular candidate.
+    threshold = min(0.58, np.max(sims) * 0.85)
+
+    verified = []
+    unverified = []
+    
+    weighted_verified_sum = 0.0
+    weighted_total_sum = 0.0
+
+    for i, skill in enumerate(unique_claimed):
+        sim = sims[i]
+        
+        # Exponentially scale relevance above the threshold so core required skills matter most
+        if sim > threshold:
+            weight = (sim - threshold) ** 2
+        else:
+            weight = 0.0 # completely ignore irrelevant skills
+            
+        is_verified = verified_flags[skill]
+        if is_verified:
+            verified.append(skill)
+            weighted_verified_sum += weight
+        else:
+            unverified.append(skill)
+            
+        weighted_total_sum += weight
+
+    # If all skills were completely irrelevant (weight 0), ratio is neutral (1.0 or 0.0 depending on strictness)
+    # Give them 1.0 so we don't penalize them if the JD literally matches zero of their skills (the semantic match will penalize them anyway)
+    ratio = (weighted_verified_sum / weighted_total_sum) if weighted_total_sum > 0 else 1.0
+    
+    return float(ratio), sorted(verified), sorted(unverified)
 
 
 def _compute_experience_signal(
@@ -188,14 +235,16 @@ def compute_final_score(
     # 2. Evidence Match: JD text ↔ code files
     if code_contents:
         code_embs = embed_codes(code_contents)
+        print(jd_emb)
+        print(code_embs)
         evidence_match = mean_cosine_similarity(jd_emb, code_embs)
         evidence_match = max(0.0, min(1.0, evidence_match))
     else:
         evidence_match = 0.0
 
-    # 3. Verification Ratio: claimed skills ↔ GitHub-verified skills
+    # 3. Verification Ratio: claimed skills ↔ GitHub-verified skills (weighted by relevance to JD)
     verification_ratio, verified_list, unverified_list = _compute_verification_ratio(
-        claimed_skills, verified_deps
+        jd_emb, claimed_skills, verified_deps
     )
 
     # 4. Experience Signal
@@ -256,7 +305,7 @@ if __name__ == "__main__":
         jd_text="Looking for a Python backend engineer with FastAPI and ML experience.",
         resume_text="Experienced Python developer with FastAPI, scikit-learn, Docker, PostgreSQL.",
         code_contents=["import fastapi\nfrom sklearn import pipeline\ndef train(): pass"],
-        claimed_skills=["Python", "FastAPI", "scikit-learn", "Docker", "PostgreSQL"],
+        claimed_skills=["Python", "FastAPI", "scikit-learn", "Docker", "PostgreSQL", "Photoshop", "Excel"],
         verified_deps=["fastapi", "scikit-learn", "docker"],
         work_history=[{"role": "Backend Engineer", "duration_months": 36}],
         has_github_evidence=True,

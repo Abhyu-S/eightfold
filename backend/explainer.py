@@ -13,7 +13,8 @@ import json
 import logging
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from backend.cache import cache_get, cache_set, _make_key
 from backend.config import settings
@@ -21,7 +22,7 @@ from backend.scorer import ScoringResult
 
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=settings.GOOGLE_API_KEY)
+client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 
 EXPLANATION_SCHEMA = {
@@ -177,16 +178,15 @@ def generate_explanation(
             pass
 
     # Call Gemini Pro
-    model = genai.GenerativeModel(
-        settings.GEMINI_MODEL_FLASH,
-        generation_config=genai.types.GenerationConfig(
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL_FLASH,
+        contents=prompt_text,
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=EXPLANATION_SCHEMA,
             temperature=0.0,
         ),
     )
-
-    response = model.generate_content(prompt_text)
     explanation = json.loads(response.text)
 
     # Cache the result

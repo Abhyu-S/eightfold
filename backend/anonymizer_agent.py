@@ -14,7 +14,8 @@ import logging
 import os
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 from backend.config import settings
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 USE_MOCK_DATA: bool = settings.USE_MOCK_DATA
 
 # ── Configure Gemini ──────────────────────────────────────────────────────────
-genai.configure(api_key=settings.GOOGLE_API_KEY)
+client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 
 # ============================================================
@@ -135,10 +136,10 @@ def redact_pii(raw_text: str) -> str:
         logger.info("PII redaction loaded from cache")
         return cached
 
-    model = genai.GenerativeModel(settings.GEMINI_MODEL_FLASH)
-    response = model.generate_content(
-        [REDACTION_PROMPT, f"Resume text:\n---\n{raw_text}\n---"],
-        generation_config=genai.types.GenerationConfig(
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL_FLASH,
+        contents=[REDACTION_PROMPT, f"Resume text:\n---\n{raw_text}\n---"],
+        config=types.GenerateContentConfig(
             temperature=0.0,
         ),
     )
@@ -304,17 +305,14 @@ def extract_structured_profile(text: str, pdf_links: list[str] = None) -> dict:
             links_section += f"- {link}\n"
         links_section += "\nUse these actual URLs in your extraction. Do NOT invent additional URLs."
 
-    model = genai.GenerativeModel(
-        settings.GEMINI_MODEL_FLASH,
-        generation_config=genai.types.GenerationConfig(
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL_FLASH,
+        contents=[EXTRACTION_PROMPT, f"Resume text:\n---\n{text}\n---{links_section}"],
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=EXTRACTION_SCHEMA,
             temperature=0.0,
         ),
-    )
-
-    response = model.generate_content(
-        [EXTRACTION_PROMPT, f"Resume text:\n---\n{text}\n---{links_section}"]
     )
 
     parsed = json.loads(response.text)
