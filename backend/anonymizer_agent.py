@@ -1,35 +1,12 @@
 """
 anonymizer_agent.py
 --------------------
-Uses an LLM (via LangChain) to:
-  1. Strip all PII (name, age, gender, location, contact details) from raw resume text.
+Uses Gemini (native structured output) to:
+  1. Strip all PII from raw resume text (name, gender, location, university, etc.)
   2. Parse the cleaned text into a structured JSON candidate profile.
+  3. Extract external URLs (GitHub, Codeforces, project links) separately.
 
-Supports both OpenAI (GPT-4o) and Google Gemini backends via the LLM_PROVIDER env var.
-
-Output JSON schema:
-{
-    "skills": ["Python", "FastAPI", ...],
-    "years_of_experience": 4,
-    "education": [{"degree": "B.Tech CS", "institution": "Redacted", "year": 2020}],
-    "work_history": [
-        {
-            "role": "Software Engineer",
-            "company": "Tech Company A",
-            "duration_months": 24,
-            "key_achievements": ["Built X", "Led Y"]
-        }
-    ],
-    "certifications": ["AWS Solutions Architect"],
-    "projects": [
-        {
-            "name": "Project Name",
-            "description": "What it does",
-            "tech_stack": ["Python", "React"]
-        }
-    ],
-    "pii_removed": true
-}
+No LangChain. Direct google-generativeai SDK with response_schema.
 """
 
 import json
@@ -37,15 +14,20 @@ import logging
 import os
 from typing import Optional
 
+import google.generativeai as genai
 from dotenv import load_dotenv
-from langchain.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+
+from backend.config import settings
+from backend.cache import cache_get, cache_set, _make_key
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ── Feature Flag ──────────────────────────────────────────────────────────────
-USE_MOCK_DATA: bool = os.getenv("USE_MOCK_DATA", "False").lower() == "true"
+USE_MOCK_DATA: bool = settings.USE_MOCK_DATA
+
+# ── Configure Gemini ──────────────────────────────────────────────────────────
+genai.configure(api_key=settings.GOOGLE_API_KEY)
 
 
 # ============================================================
@@ -90,198 +72,317 @@ MOCK_ANONYMIZED_PROFILE = {
             "name": "ML Pipeline Automation",
             "description": "End-to-end ML pipeline with automated retraining and drift detection",
             "tech_stack": ["Python", "scikit-learn", "Apache Airflow", "Docker"],
+            "url": "https://github.com/octocat/ml-pipeline",
         }
     ],
+    "external_urls": [
+        {"url": "https://github.com/octocat", "type": "github_profile"},
+        {"url": "https://codeforces.com/profile/tourist", "type": "codeforces"},
+    ],
+    "github_username": "octocat",
+    "codeforces_handle": "tourist",
     "pii_removed": True,
 }
 
 
 # ============================================================
-# LLM FACTORY
+# PII REDACTION
 # ============================================================
 
-def _build_llm():
+REDACTION_PROMPT = """\
+You are a Privacy AI. Your ONLY job is to take raw resume text and return a \
+redacted version where ALL personally identifiable information is replaced.
+
+REMOVE / REPLACE:
+- Full name, nicknames, initials → "[Name Redacted]"
+- Email addresses → "[Email Redacted]"
+- Phone numbers → "[Phone Redacted]"
+- Home city, state, country, ZIP → "[Location Redacted]"
+- Age, date of birth, gender, nationality, ethnicity, religion → remove entirely
+- University/college names → "[University Redacted]"
+- Company names → "[Company Redacted]"  (but keep the role/title/achievements)
+- LinkedIn/social URLs → remove (but keep GitHub/Codeforces URLs)
+- Profile photos or physical descriptions → remove
+
+PRESERVE EXACTLY:
+- All technical skills, frameworks, languages
+- Project descriptions and tech stacks
+- Role titles and job achievements
+- GitHub repository URLs and Codeforces handles
+- Certifications and their names
+- Duration of employment (months/years)
+
+Return ONLY the redacted text. No extra commentary.
+"""
+
+
+def redact_pii(raw_text: str) -> str:
     """
-    Instantiate the correct LLM based on the LLM_PROVIDER env var.
-    Raises a clear error if the required API key is missing.
+    Strip all PII from raw resume text using Gemini Flash.
+    Returns the redacted text string.
+    Results are cached by content hash.
     """
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model = os.getenv("LLM_MODEL", "gpt-4o")
+    if USE_MOCK_DATA:
+        return "[Name Redacted] is a software engineer with 5 years of experience..."
 
-    if provider == "openai":
-        from langchain_openai import ChatOpenAI
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
-            raise EnvironmentError("OPENAI_API_KEY is not set in .env")
-        return ChatOpenAI(model=model, temperature=0, openai_api_key=api_key)
+    if not raw_text or not raw_text.strip():
+        return ""
 
-    elif provider == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        api_key = os.getenv("GOOGLE_API_KEY", "")
-        if not api_key:
-            raise EnvironmentError("GOOGLE_API_KEY is not set in .env")
-        return ChatGoogleGenerativeAI(model=model, temperature=0, google_api_key=api_key)
+    # Check cache
+    cache_key = f"redact_pii:{_make_key(raw_text)}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        logger.info("PII redaction loaded from cache")
+        return cached
 
-    else:
-        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use 'openai' or 'gemini'.")
+    model = genai.GenerativeModel(settings.GEMINI_MODEL_FLASH)
+    response = model.generate_content(
+        [REDACTION_PROMPT, f"Resume text:\n---\n{raw_text}\n---"],
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.0,
+        ),
+    )
+    redacted = response.text.strip()
+
+    cache_set(cache_key, redacted)
+    logger.info("PII redacted: %d → %d chars", len(raw_text), len(redacted))
+    return redacted
 
 
 # ============================================================
-# PROMPTS
+# STRUCTURED EXTRACTION
 # ============================================================
 
-ANONYMIZER_SYSTEM_PROMPT = """\
-You are a Privacy & Talent Assessment AI. Your task is to process raw resume text and return a STRICT JSON object.
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "skills": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "All technical skills, programming languages, frameworks, tools mentioned"
+        },
+        "years_of_experience": {
+            "type": "integer",
+            "description": "Total estimated years of professional experience"
+        },
+        "education": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "degree": {"type": "string"},
+                    "institution": {"type": "string", "description": "Use [University Redacted] if in redacted text"},
+                    "year": {"type": "integer"}
+                },
+                "required": ["degree"]
+            }
+        },
+        "work_history": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string"},
+                    "company": {"type": "string"},
+                    "duration_months": {"type": "integer"},
+                    "key_achievements": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["role"]
+            }
+        },
+        "certifications": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "projects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "tech_stack": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "url": {"type": "string", "description": "Project URL if listed (GitHub, etc.)"}
+                },
+                "required": ["name"]
+            }
+        },
+        "external_urls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "type": {
+                        "type": "string",
+                        "description": "One of: github_profile, github_repo, codeforces, leetcode, portfolio, other"
+                    }
+                },
+                "required": ["url", "type"]
+            },
+            "description": "All external URLs found in the resume"
+        },
+        "github_username": {
+            "type": "string",
+            "description": "GitHub username extracted from profile URL. null if not found."
+        },
+        "codeforces_handle": {
+            "type": "string",
+            "description": "Codeforces handle extracted from profile URL. null if not found."
+        }
+    },
+    "required": ["skills", "projects", "external_urls"]
+}
+
+EXTRACTION_PROMPT = """\
+You are a Talent Data Extraction AI. Parse the following resume text into a \
+structured JSON profile.
 
 RULES:
-1. Remove ALL personally identifiable information (PII):
-   - Full name, nicknames, initials
-   - Email addresses, phone numbers, URLs/social media handles
-   - Home city, state, country, ZIP codes
-   - Age, date of birth, gender, nationality, ethnicity, religion
-   - LinkedIn, GitHub, Twitter URLs (the URLs themselves — keep content/skills)
-   - University/company names may be replaced with "[University Redacted]" or "[Company Redacted]"
-2. Preserve all technical content: skills, tech stacks, achievements, project descriptions.
-3. Estimate `years_of_experience` as an integer from work history dates.
-4. Output ONLY valid JSON — no markdown, no extra text, no code fences.
-5. Follow the exact schema provided below.
+1. Extract ALL technical skills, frameworks, languages, and tools mentioned.
+2. Extract ALL external URLs that are EXPLICITLY written in the resume text.
+3. For GitHub profile URLs like github.com/username, extract the username.
+4. For Codeforces URLs like codeforces.com/profile/handle, extract the handle.
+5. Estimate years_of_experience from work history dates.
+6. List all projects with their tech stacks and URLs.
+7. If information is missing, use null or empty arrays.
 
-OUTPUT SCHEMA:
-{
-  "skills": ["string"],
-  "years_of_experience": integer,
-  "education": [
-    {
-      "degree": "string",
-      "institution": "string (redact if identifiable)",
-      "year": integer or null
-    }
-  ],
-  "work_history": [
-    {
-      "role": "string",
-      "company": "string (use [Company Redacted] or generic descriptor)",
-      "duration_months": integer,
-      "key_achievements": ["string"]
-    }
-  ],
-  "certifications": ["string"],
-  "projects": [
-    {
-      "name": "string",
-      "description": "string",
-      "tech_stack": ["string"]
-    }
-  ],
-  "pii_removed": true
-}
-"""
+CRITICAL: Do NOT invent, guess, or hallucinate any URLs, usernames, or handles.
+Only extract information that is EXPLICITLY present in the text.
+If there is no Codeforces URL in the text, set codeforces_handle to null.
+If there is no GitHub URL in the text, set github_username to null.
+Do NOT make up URLs that are not in the text.
 
-ANONYMIZER_HUMAN_PROMPT = """\
-Here is the raw resume text to process:
-
----
-{resume_text}
----
-
-Return the anonymized JSON profile now.
+Return ONLY the JSON object matching the schema.
 """
 
 
-# ============================================================
-# MAIN PUBLIC FUNCTION
-# ============================================================
-
-def anonymize_and_parse_resume(
-    resume_text: str,
-    llm=None,
-) -> dict:
+def extract_structured_profile(text: str, pdf_links: list[str] = None) -> dict:
     """
-    Strip PII from resume text and parse it into a structured JSON profile.
+    Parse resume text (original or redacted) into a structured JSON profile
+    using Gemini Flash with native structured output.
 
     Parameters
     ----------
-    resume_text : str
-        Raw text extracted from a PDF resume.
-    llm : optional
-        Pre-built LangChain LLM instance. If None, one is created from env vars.
+    text : str
+        Resume text (from PDF extraction).
+    pdf_links : list[str], optional
+        Pre-extracted hyperlinks from PDF annotations.
+        These are merged into the profile to ensure no links are missed.
 
-    Returns
-    -------
-    dict
-        Structured anonymized candidate profile.
-
-    Raises
-    ------
-    ValueError
-        If the LLM returns output that cannot be parsed as valid JSON.
+    Returns a dict matching the EXTRACTION_SCHEMA.
     """
     if USE_MOCK_DATA:
         logger.info("USE_MOCK_DATA=True — returning mock anonymized profile")
         return dict(MOCK_ANONYMIZED_PROFILE)
 
-    if not resume_text or not resume_text.strip():
-        raise ValueError("resume_text is empty — cannot anonymize.")
+    if not text or not text.strip():
+        raise ValueError("Input text is empty — cannot extract profile.")
 
-    # Build LLM if not provided
-    if llm is None:
-        llm = _build_llm()
+    # Check cache (include pdf_links in cache key)
+    links_key = ",".join(sorted(pdf_links or []))
+    cache_key = f"extract_profile:{_make_key(text + links_key)}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        try:
+            logger.info("Structured profile loaded from cache")
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            pass
 
-    # ── LangChain LCEL Chain ─────────────────────────────────────────────
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", ANONYMIZER_SYSTEM_PROMPT),
-        ("human", ANONYMIZER_HUMAN_PROMPT),
-    ])
-    chain = prompt | llm | StrOutputParser()
+    # Include PDF-extracted links in the prompt so the LLM knows about them
+    links_section = ""
+    if pdf_links:
+        links_section = "\n\nThe following hyperlinks were extracted from the PDF document:\n"
+        for link in pdf_links:
+            links_section += f"- {link}\n"
+        links_section += "\nUse these actual URLs in your extraction. Do NOT invent additional URLs."
 
-    logger.info("Invoking anonymization LLM chain (%d chars input)...", len(resume_text))
+    model = genai.GenerativeModel(
+        settings.GEMINI_MODEL_FLASH,
+        generation_config=genai.types.GenerationConfig(
+            response_mime_type="application/json",
+            response_schema=EXTRACTION_SCHEMA,
+            temperature=0.0,
+        ),
+    )
 
-    raw_output = chain.invoke({"resume_text": resume_text})
+    response = model.generate_content(
+        [EXTRACTION_PROMPT, f"Resume text:\n---\n{text}\n---{links_section}"]
+    )
 
-    # ── Parse JSON robustly ───────────────────────────────────────────────
-    parsed = _parse_json_robustly(raw_output)
+    parsed = json.loads(response.text)
+    parsed["pii_removed"] = "[Redacted]" in text or "[redacted]" in text.lower()
+
+    # Merge PDF-extracted links that the LLM might have missed
+    if pdf_links:
+        existing_urls = {u.get("url", "") for u in parsed.get("external_urls", [])}
+        for link in pdf_links:
+            if link not in existing_urls:
+                link_type = _classify_url(link)
+                parsed.setdefault("external_urls", []).append(
+                    {"url": link, "type": link_type}
+                )
+                # Also set github_username / codeforces_handle if found
+                if link_type == "github_profile" and not parsed.get("github_username"):
+                    from backend.github_scraper import extract_github_username
+                    username = extract_github_username(link)
+                    if username:
+                        parsed["github_username"] = username
+                elif link_type == "codeforces" and not parsed.get("codeforces_handle"):
+                    from backend.codeforces_scraper import extract_codeforces_handle
+                    handle = extract_codeforces_handle(link)
+                    if handle:
+                        parsed["codeforces_handle"] = handle
+
+    # Cache the result
+    cache_set(cache_key, json.dumps(parsed, ensure_ascii=False))
+
     logger.info(
-        "Anonymization complete. Skills found: %d, Experience: %s yrs",
+        "Extraction complete. Skills: %d, URLs: %d, Projects: %d",
         len(parsed.get("skills", [])),
-        parsed.get("years_of_experience", "?"),
+        len(parsed.get("external_urls", [])),
+        len(parsed.get("projects", [])),
     )
     return parsed
 
 
-def _parse_json_robustly(raw: str) -> dict:
+def _classify_url(url: str) -> str:
+    """Classify a URL into a type."""
+    url_lower = url.lower()
+    if "github.com" in url_lower:
+        # Check if it's a repo URL or a profile URL
+        parts = url_lower.rstrip("/").split("github.com/")[-1].split("/")
+        if len(parts) >= 2:
+            return "github_repo"
+        return "github_profile"
+    if "codeforces.com" in url_lower:
+        return "codeforces"
+    if "leetcode.com" in url_lower:
+        return "leetcode"
+    if "linkedin.com" in url_lower:
+        return "linkedin"
+    if "kaggle.com" in url_lower:
+        return "kaggle"
+    return "other"
+
+
+def anonymize_and_parse_resume(resume_text: str, pdf_links: list[str] = None) -> dict:
     """
-    Attempt to extract and parse JSON from LLM output.
-    Handles cases where the model adds extra prose or markdown fences.
+    Full pipeline: redact PII then extract structured profile.
+    Convenience wrapper that returns the profile from redacted text.
+    Also returns the redacted text itself for bias checking.
     """
-    raw = raw.strip()
-
-    # Remove common markdown code fences
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        raw = "\n".join(
-            line for line in lines
-            if not line.strip().startswith("```")
-        )
-
-    # Try direct parse
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # Try finding the first { ... } block
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-    if start != -1 and end > start:
-        try:
-            return json.loads(raw[start:end])
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"LLM output could not be parsed as JSON.\n"
-                f"Raw output:\n{raw}\n\nError: {exc}"
-            ) from exc
-
-    raise ValueError(f"No JSON object found in LLM output:\n{raw}")
+    redacted_text = redact_pii(resume_text)
+    profile = extract_structured_profile(redacted_text, pdf_links=pdf_links)
+    profile["_redacted_text"] = redacted_text
+    return profile
 
 
 # ── CLI quick-test ────────────────────────────────────────────────────────────

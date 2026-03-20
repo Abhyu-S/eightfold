@@ -1,2 +1,38 @@
-backend/__pycache__/*
-*.env*
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Caching
+cache.db
+*.db
+
+# Embeddings models (downloaded at runtime)
+models/
+
+# ChromaDB (legacy)
+chroma_db/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend (legacy Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/

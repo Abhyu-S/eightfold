@@ -1,8 +1,7 @@
 """
 config.py
 ---------
-Central configuration loader for the platform.
-All settings are read from environment variables (via .env).
+Central configuration loader. All settings from environment variables (via .env).
 """
 
 import os
@@ -12,22 +11,26 @@ load_dotenv()
 
 
 class Settings:
-    # LLM
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai").lower()
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    # ── Gemini LLM ───────────────────────────────────────────────────────
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
+    GEMINI_MODEL_FLASH: str = os.getenv("GEMINI_MODEL_FLASH", "gemini-2.0-flash")
+    GEMINI_MODEL_PRO: str = os.getenv("GEMINI_MODEL_PRO", "gemini-2.0-flash-thinking-exp-01-21")
 
-    # GitHub
+    # ── GitHub ───────────────────────────────────────────────────────────
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 
-    # Vector DB
-    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+    # ── Embeddings ───────────────────────────────────────────────────────
+    EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "local")  # "local" or "gemini"
+    TEXT_EMBED_MODEL: str = os.getenv("TEXT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    CODE_EMBED_MODEL: str = os.getenv("CODE_EMBED_MODEL", "all-MiniLM-L6-v2")
 
-    # Feature flags
+    # ── Caching ──────────────────────────────────────────────────────────
+    SQLITE_CACHE_PATH: str = os.getenv("SQLITE_CACHE_PATH", "./cache.db")
+
+    # ── Feature flags ────────────────────────────────────────────────────
     USE_MOCK_DATA: bool = os.getenv("USE_MOCK_DATA", "False").lower() == "true"
 
-    # Server
+    # ── Server ───────────────────────────────────────────────────────────
     APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 
 
