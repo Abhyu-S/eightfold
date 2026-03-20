@@ -1,5 +1,6 @@
 /* ============================================================
-   globals.css – Eightfold Design System
+   globals.css – Eightfold Design System v2
+   Multi-Agent Debate UI
    ============================================================ */
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -30,6 +31,9 @@
   --gradient-card:    linear-gradient(145deg, #0f2340 0%, #0d1b2e 100%);
   --gradient-green:   linear-gradient(135deg, #059669 0%, #10b981 100%);
   --gradient-amber:   linear-gradient(135deg, #d97706 0%, #f59e0b 100%);
+
+  /* Shadows */
+  --shadow-glow: 0 0 40px rgba(59, 130, 246, 0.1);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -58,6 +62,7 @@ body {
 
 .glow-blue  { box-shadow: 0 0 30px rgba(59, 130, 246, 0.15); }
 .glow-purple{ box-shadow: 0 0 30px rgba(139, 92, 246, 0.15); }
+.glow-green { box-shadow: 0 0 30px rgba(16, 185, 129, 0.15); }
 
 .badge {
   display: inline-flex;
@@ -75,11 +80,6 @@ body {
 .badge-amber  { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.25); }
 .badge-red    { background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
 .badge-purple { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.25); }
-
-/* Score ring colors */
-.score-high   { color: #34d399; }
-.score-medium { color: #fbbf24; }
-.score-low    { color: #f87171; }
 
 /* Input / Textarea */
 .input-field {
@@ -131,10 +131,176 @@ body {
 }
 .btn-secondary:hover { border-color: var(--accent-blue); color: var(--text-primary); }
 
-/* Divider */
-.divider { height: 1px; background: var(--border); margin: 20px 0; }
+/* ── Debate Timeline ── */
+.debate-timeline {
+  position: relative;
+  padding-left: 24px;
+}
 
-/* Pulse animation */
+.debate-timeline::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent-blue), var(--accent-purple), var(--accent-green));
+  border-radius: 2px;
+}
+
+.debate-entry {
+  position: relative;
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(15, 35, 64, 0.4);
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.debate-entry:hover {
+  border-color: var(--border-light);
+  background: rgba(15, 35, 64, 0.6);
+}
+
+.debate-entry::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  top: 16px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid;
+}
+
+.debate-entry.advocate::before { border-color: var(--accent-green); background: rgba(16, 185, 129, 0.3); }
+.debate-entry.critic::before { border-color: var(--accent-red); background: rgba(239, 68, 68, 0.3); }
+.debate-entry.fairness::before { border-color: var(--accent-blue); background: rgba(59, 130, 246, 0.3); }
+.debate-entry.verdict::before { border-color: var(--accent-purple); background: rgba(139, 92, 246, 0.3); width: 12px; height: 12px; left: -21px; top: 15px; }
+
+/* ── Skill badges ── */
+.skill-matched {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  border-radius: 20px;
+  color: #34d399;
+  font-size: 0.78rem;
+  font-weight: 500;
+  margin: 3px;
+}
+
+.skill-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 20px;
+  color: #f87171;
+  font-size: 0.78rem;
+  font-weight: 500;
+  margin: 3px;
+}
+
+.skill-extra {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 20px;
+  color: #fbbf24;
+  font-size: 0.78rem;
+  font-weight: 500;
+  margin: 3px;
+}
+
+.skill-verified {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  border-radius: 20px;
+  color: #34d399;
+  font-size: 0.78rem;
+  font-weight: 500;
+  margin: 3px;
+}
+
+.skill-unverified {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 20px;
+  color: #fbbf24;
+  font-size: 0.78rem;
+  font-weight: 500;
+  margin: 3px;
+}
+
+/* ── Section headers ── */
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1rem;
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.section-card {
+  background: rgba(15, 35, 64, 0.4);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px;
+  margin-bottom: 16px;
+  transition: border-color 0.2s;
+}
+
+.section-card:hover {
+  border-color: var(--border-light);
+}
+
+/* ── Verdict badge ── */
+.verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+}
+
+/* ── Progress bars ── */
+.progress-bar {
+  height: 6px;
+  background: var(--bg-secondary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.8s ease;
+}
+
+/* ── Animations ── */
 @keyframes pulse-ring {
   0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
   70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
@@ -146,9 +312,27 @@ body {
   100% { background-position: 200% 0; }
 }
 
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .skeleton {
   background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-card-hover) 50%, var(--bg-card) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
   border-radius: 6px;
+}
+
+.spin { animation: spin 1s linear infinite; }
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .main-grid {
+    grid-template-columns: 1fr !important;
+  }
 }

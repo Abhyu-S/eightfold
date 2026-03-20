@@ -2,9 +2,11 @@
 main.py
 -------
 FastAPI orchestrator for the AI Resume Screener.
-Single endpoint that runs the full pipeline:
+Full pipeline:
   PDF → Redact PII → Extract Profile → Scrape GitHub/Codeforces →
-  Embed → Score (deterministic) → Bias Check → Explain
+  Embed → Score (deterministic) → Bias Check → Normalize Skills →
+  FAISS Matching → Skill Graph → Evidence Bundle → Multi-Agent Debate →
+  Final Report
 """
 
 import logging
@@ -26,13 +28,19 @@ from backend.github_scraper import (
 from backend.codeforces_scraper import fetch_codeforces_profile, extract_codeforces_handle
 from backend.scorer import compute_final_score
 from backend.explainer import generate_explanation
+from backend.skill_taxonomy import normalize_skill_list
+from backend.vector_engine import compute_vector_match
+from backend.skill_graph import build_skill_graph
+from backend.evidence_bundle import build_evidence_bundle
+from backend.agents.orchestrator import run_debate
+from backend.report.generator import generate_report
 
 logger = get_logger(__name__)
 
 app = FastAPI(
     title="AI Resume Screener",
-    description="Bias-free, deterministic candidate evaluation with glass-box explainability.",
-    version="2.0.0",
+    description="Bias-free, deterministic candidate evaluation with multi-agent debate and glass-box explainability.",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -72,10 +80,8 @@ def _extract_all_urls(profile: dict) -> list[dict]:
 
 def _find_github_username(profile: dict) -> str | None:
     """Find GitHub username from profile data."""
-    # Direct field
     if profile.get("github_username"):
         return profile["github_username"]
-    # From URLs
     for url_info in profile.get("external_urls", []):
         url = url_info.get("url", "")
         if "github.com" in url:
@@ -106,11 +112,43 @@ def _collect_code_contents(github_data: dict) -> list[str]:
             content = f.get("content", "")
             if content.strip():
                 contents.append(content)
-        # Also include README as a signal
         readme = signals.get("readme")
         if readme:
             contents.append(readme)
     return contents
+
+
+def _extract_jd_skills(jd_text: str) -> list[str]:
+    """Extract skill keywords from job description text using simple heuristics."""
+    # Common tech keywords to look for
+    import re
+    # Find words that look like technology names
+    # This is a simple approach; in production you'd use NLP
+    common_tech = [
+        "python", "java", "javascript", "typescript", "go", "golang", "rust",
+        "c++", "c#", "ruby", "php", "swift", "kotlin", "scala",
+        "react", "angular", "vue", "svelte", "next.js", "node.js",
+        "fastapi", "flask", "django", "express", "spring",
+        "docker", "kubernetes", "aws", "gcp", "azure", "terraform",
+        "postgresql", "mysql", "mongodb", "redis", "elasticsearch",
+        "kafka", "rabbitmq", "graphql", "rest", "grpc",
+        "machine learning", "deep learning", "nlp", "computer vision",
+        "tensorflow", "pytorch", "scikit-learn", "pandas", "numpy",
+        "git", "ci/cd", "jenkins", "github actions",
+        "linux", "nginx", "apache",
+        "html", "css", "sass", "tailwind",
+        "agile", "scrum",
+        "spark", "hadoop", "airflow",
+        "competitive programming", "data structures", "algorithms",
+    ]
+
+    jd_lower = jd_text.lower()
+    found = []
+    for tech in common_tech:
+        if tech in jd_lower:
+            found.append(tech)
+
+    return found
 
 
 @app.post("/api/evaluate")
@@ -121,7 +159,8 @@ async def evaluate_candidate(
     """
     Full pipeline evaluation of a candidate resume against a job description.
 
-    Returns deterministic scores, bias check results, and glass-box explanations.
+    Returns deterministic scores, multi-agent debate results, bias check,
+    and glass-box explanations.
     """
     candidate_id = str(uuid.uuid4())[:8]
     logger.info("=== Evaluating candidate %s ===", candidate_id)
@@ -206,12 +245,9 @@ async def evaluate_candidate(
     logger.info("Step 8: Score computed — final=%.4f", scoring_result.final_score)
 
     # ── Step 9: Bias check — score on original vs redacted ───────────────
-    # Since we always score on redacted text, the score is already bias-free.
-    # For the demo: re-score on the original text (which has PII) and verify delta ≈ 0.
-    # The delta should be non-zero ONLY because embedding of PII text differs slightly.
     original_scoring = compute_final_score(
         jd_text=job_description,
-        resume_text=raw_text,  # Original text WITH PII
+        resume_text=raw_text,
         code_contents=code_contents,
         claimed_skills=original_profile.get("skills", []),
         verified_deps=verified_deps,
@@ -222,10 +258,76 @@ async def evaluate_candidate(
     )
 
     bias_delta = abs(scoring_result.final_score - original_scoring.final_score)
+    bias_check = {
+        "redacted_score": scoring_result.final_score,
+        "original_score": original_scoring.final_score,
+        "delta": round(bias_delta, 6),
+        "is_bias_free": bias_delta < 0.01,
+    }
     logger.info("Step 9: Bias check — redacted=%.4f, original=%.4f, delta=%.6f",
                scoring_result.final_score, original_scoring.final_score, bias_delta)
 
-    # ── Step 10: Generate explanation ────────────────────────────────────
+    # ── Step 10: Normalize skills via taxonomy ───────────────────────────
+    jd_skills_raw = _extract_jd_skills(job_description)
+    jd_skills = normalize_skill_list(jd_skills_raw)
+    candidate_skills = normalize_skill_list(claimed_skills)
+    logger.info("Step 10: Normalized %d JD skills, %d candidate skills",
+               len(jd_skills), len(candidate_skills))
+
+    # ── Step 11: FAISS-based skill similarities ──────────────────────────
+    vector_result = compute_vector_match(
+        jd_text=job_description,
+        resume_text=redacted_text,
+        jd_skills=jd_skills,
+        candidate_skills=candidate_skills,
+    )
+    logger.info("Step 11: Vector match — overall=%.4f, %d skill matches",
+               vector_result.overall_similarity, len(vector_result.skill_matches))
+
+    # ── Step 12: Build skill graph ───────────────────────────────────────
+    graph_analysis = build_skill_graph(
+        jd_skills=jd_skills,
+        candidate_skills=candidate_skills,
+        skill_matches=vector_result.skill_matches,
+        work_history=work_history,
+        verified_skills=scoring_result.verified_skills,
+    )
+    logger.info("Step 12: Skill graph — %.1f%% match, %d matched, %d missing",
+               graph_analysis.match_percentage,
+               len(graph_analysis.matched_skills),
+               len(graph_analysis.missing_skills))
+
+    # ── Step 13: Assemble evidence bundle ────────────────────────────────
+    evidence_bundle = build_evidence_bundle(
+        vector_result=vector_result,
+        graph_analysis=graph_analysis,
+        scoring_result=scoring_result,
+        jd_text=job_description,
+        work_history=work_history,
+        github_data=github_data,
+        codeforces_data=codeforces_data,
+    )
+    logger.info("Step 13: Evidence bundle assembled")
+
+    # ── Step 14: Multi-agent debate ──────────────────────────────────────
+    debate_result = {"verdict": {}, "debate_log": [], "rounds": [], "num_rounds": 0}
+    try:
+        debate_result = run_debate(evidence_bundle, num_rounds=2)
+        logger.info("Step 14: Debate complete — verdict=%s",
+                    debate_result.get("verdict", {}).get("recommendation"))
+    except Exception as exc:
+        logger.error("Debate pipeline failed: %s", exc)
+        debate_result["verdict"] = {
+            "recommendation": "neutral",
+            "confidence": "low",
+            "verdict_summary": f"Debate pipeline encountered an error. Score: {scoring_result.final_score:.2f}/1.0",
+            "key_strengths": ["Score computed successfully"],
+            "key_concerns": ["Debate pipeline unavailable"],
+            "debate_quality": "N/A — debate failed",
+            "fairness_assessment": "N/A",
+        }
+
+    # ── Step 15: Generate explanation ────────────────────────────────────
     explanation = {}
     try:
         explanation = generate_explanation(
@@ -235,7 +337,7 @@ async def evaluate_candidate(
             codeforces_data=codeforces_data,
             work_history=work_history,
         )
-        logger.info("Step 10: Explanation generated")
+        logger.info("Step 15: Explanation generated")
     except Exception as exc:
         logger.error("Explanation generation failed: %s", exc)
         explanation = {
@@ -245,54 +347,34 @@ async def evaluate_candidate(
             "skill_evidence": [],
         }
 
-    # ── Build response ───────────────────────────────────────────────────
-    response = {
-        "candidate_id": candidate_id,
-        "final_score": scoring_result.final_score,
-        "final_score_pct": round(scoring_result.final_score * 100, 2),
-        "score_breakdown": scoring_result.component_breakdown,
-        "bias_check": {
-            "redacted_score": scoring_result.final_score,
-            "original_score": original_scoring.final_score,
-            "delta": round(bias_delta, 6),
-            "is_bias_free": bias_delta < 0.01,
-        },
-        "explanation": explanation,
-        "skills": {
-            "verified": scoring_result.verified_skills,
-            "unverified": scoring_result.unverified_skills,
-            "claimed_count": len(claimed_skills),
-            "verified_count": len(scoring_result.verified_skills),
-        },
-        "github_summary": {
-            "username": github_username,
-            "repos_analyzed": len(github_data.get("top_repos", [])),
-            "languages": github_data.get("language_distribution", {}),
-            "verified_deps": verified_deps[:20],
-            "top_repos": [
-                {"name": r["name"], "stars": r["stars"], "language": r["language"]}
-                for r in github_data.get("top_repos", [])[:5]
-            ],
-        },
-        "codeforces_summary": {
-            "handle": codeforces_handle,
-            "max_rating": codeforces_data.get("max_rating") if codeforces_data else None,
-            "rank": codeforces_data.get("rank") if codeforces_data else None,
-            "contests": codeforces_data.get("contests_participated", 0) if codeforces_data else 0,
-            "solved_approx": codeforces_data.get("solved_problems_approx", 0) if codeforces_data else 0,
-            "problem_distribution": codeforces_data.get("problem_rating_distribution", {}) if codeforces_data else {},
-        },
-        "profile": {
-            "skills": redacted_profile.get("skills", []),
-            "years_of_experience": redacted_profile.get("years_of_experience"),
-            "work_history": work_history,
-            "projects": redacted_profile.get("projects", []),
-            "certifications": redacted_profile.get("certifications", []),
-        },
+    # ── Step 16: Generate final report ───────────────────────────────────
+    report = generate_report(
+        scoring_result=scoring_result,
+        evidence_bundle=evidence_bundle,
+        debate_result=debate_result,
+        graph_analysis=graph_analysis,
+        jd_text=job_description,
+        github_data=github_data,
+        codeforces_data=codeforces_data if codeforces_data else {},
+        bias_check=bias_check,
+        explanation=explanation,
+    )
+
+    # Add candidate_id and profile data
+    report["candidate_id"] = candidate_id
+    report["profile"] = {
+        "skills": redacted_profile.get("skills", []),
+        "years_of_experience": redacted_profile.get("years_of_experience"),
+        "work_history": work_history,
+        "projects": redacted_profile.get("projects", []),
+        "certifications": redacted_profile.get("certifications", []),
     }
 
-    logger.info("=== Evaluation complete for %s: %.2f%% ===", candidate_id, response["final_score_pct"])
-    return response
+    logger.info("=== Evaluation complete for %s: %.2f%% (%s) ===",
+               candidate_id, report["final_score_pct"],
+               report.get("recommendation_label", "N/A"))
+
+    return report
 
 
 # ── Run with uvicorn ─────────────────────────────────────────────────────────
