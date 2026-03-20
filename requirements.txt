@@ -26,6 +26,7 @@ pdfminer.six==20221105
 requests==2.32.3
 python-dotenv==1.0.1
 pydantic==2.7.4
+pydantic-settings==2.3.4
 
 # --- Data Science ---
 numpy==1.26.4
