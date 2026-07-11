@@ -12,10 +12,9 @@ No LangChain. Direct google-generativeai SDK with response_schema.
 import json
 import logging
 import os
-from typing import Optional
+from typing import Optional, Literal, List
 
 from pydantic import BaseModel, Field
-from typing import List
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -153,6 +152,10 @@ def redact_pii(raw_text: str) -> str:
 # STRUCTURED EXTRACTION
 # ============================================================
 
+class SkillEntry(BaseModel):
+    name: str
+    kind: Literal["tool", "coursework"]
+    
 class EducationEntry(BaseModel):
     degree: str
     institution: Optional[str] = None
@@ -175,7 +178,7 @@ class ExternalUrl(BaseModel):
     type: str  # github_profile | github_repo | codeforces | leetcode | portfolio | other
 
 class CandidateProfile(BaseModel):
-    skills: List[str]
+    skills: List[SkillEntry]
     years_of_experience: Optional[int] = None
     education: List[EducationEntry] = Field(default_factory=list)
     work_history: List[WorkEntry] = Field(default_factory=list)
@@ -199,6 +202,10 @@ RULES:
 6. Estimate years_of_experience from work history dates.
 7. List all projects with their tech stacks and URLs.
 8. If information is missing, use null or empty arrays.
+
+For each skill, classify it as "tool" (a specific technology, framework, or 
+language, e.g. PyTorch, FastAPI) or "coursework" (an academic subject or 
+general concept, e.g. Data Structures & Algorithms, Operating Systems).
 
 CRITICAL: Do NOT invent, guess, or hallucinate any URLs, usernames, or handles.
 Only extract information that is EXPLICITLY present in the text.
@@ -334,6 +341,13 @@ def anonymize_and_parse_resume(resume_text: str, pdf_links: list[str] = None) ->
     profile = extract_structured_profile(redacted_text, pdf_links=pdf_links)
     profile["_redacted_text"] = redacted_text
     return profile
+
+# for candiate ID generation
+import hashlib
+
+def make_candidate_id(redacted_text: str) -> str:
+    """Deterministic ID from redacted text — same resume re-ingested gets the same ID."""
+    return hashlib.sha256(redacted_text.encode()).hexdigest()[:16]
 
 
 # ── CLI quick-test ────────────────────────────────────────────────────────────
