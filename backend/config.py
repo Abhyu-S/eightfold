@@ -4,6 +4,10 @@ config.py
 Central configuration loader. All settings from environment variables (via .env).
 """
 
+# backend/config.py additions
+
+
+
 import os
 from dotenv import load_dotenv
 
@@ -11,6 +15,10 @@ load_dotenv()
 
 
 class Settings:
+    # ── LLM Provider ───────────────────────────────────────────────────────
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")  # "gemini" | "groq"
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     # ── Gemini LLM ───────────────────────────────────────────────────────
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
     GEMINI_MODEL_FLASH: str = os.getenv("GEMINI_MODEL_FLASH", "gemini-2.0-flash")
