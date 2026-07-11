@@ -154,6 +154,13 @@ def fetch_codeforces_profile(handle: str) -> dict:
         mock["handle"] = handle
         return mock
 
+    # top-level cache — avoids re-running bucketing/aggregation even when
+    # the underlying API calls are already cached
+    cache_key = f"codeforces:full_profile:{handle}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     result = {
         "handle": handle,
         "max_rating": None,
@@ -173,7 +180,7 @@ def fetch_codeforces_profile(handle: str) -> dict:
     if not user_info or not isinstance(user_info, list) or len(user_info) == 0:
         result["error"] = f"Codeforces handle '{handle}' not found or API unavailable."
         logger.warning(result["error"])
-        return result
+        return result  # don't cache errors — handle might get corrected/created later
 
     user = user_info[0]
     result["current_rating"] = user.get("rating")
@@ -214,6 +221,7 @@ def fetch_codeforces_profile(handle: str) -> dict:
         handle, result["current_rating"], result["contests_participated"],
         result["solved_problems_approx"], len(result["problem_rating_distribution"]),
     )
+    cache_set_json(cache_key, result)
     return result
 
 
