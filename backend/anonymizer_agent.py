@@ -89,7 +89,7 @@ MOCK_ANONYMIZED_PROFILE = {
 # PII REDACTION
 # ============================================================
 
-REDACTION_PROMPT = """REDACTION_PROMPT = ""\
+REDACTION_PROMPT = """
 You are a Privacy AI. Your ONLY job is to take raw resume text and return a \
 redacted version where ALL personally identifiable information is replaced.
 

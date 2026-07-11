@@ -17,11 +17,17 @@ they're verified as coarse activity checks instead (see verify_codeforces_claim
 / verify_leetcode_claim) and folded into overall_confidence as informational,
 lower-weighted signals — light or absent activity there should not aggressively
 penalize a candidate who never leaned on that platform.
+
+Every verdict carries provenance (verified_at, evidence_url/source) so a
+human can trace exactly what was checked and when, not just trust the label.
+A separate extract_red_flags() pulls all discrepancies into one flat,
+skimmable list instead of leaving them buried in prose reasoning.
 """
 
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -64,7 +70,6 @@ TECH_ALIASES = {
     "sentence bert": "sentence-transformers",
 }
 
-# Skills/keywords on a resume that Codeforces/LeetCode activity would corroborate
 CP_RELATED_KEYWORDS = {
     "competitive programming", "data structures & algorithms",
     "data structures and algorithms", "dsa", "algorithms",
@@ -73,13 +78,16 @@ CP_RELATED_KEYWORDS = {
 
 VerdictType = Literal["supported", "partially_supported", "unsupported", "insufficient_evidence"]
 
-# Numeric weight per verdict, used for weighted-average scoring across all
-# evidence sources (GitHub projects, Codeforces, LeetCode).
 _VERDICT_WEIGHT = {
     "supported": 1.0,
     "partially_supported": 0.5,
     "unsupported": 0.0,
 }
+
+
+def _now_iso() -> str:
+    """UTC timestamp for provenance — stdlib only, no external deps."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ============================================================
@@ -92,6 +100,8 @@ class ProjectVerification(BaseModel):
     matched_tech: list[str] = Field(default_factory=list)
     unmatched_claims: list[str] = Field(default_factory=list)
     evidence_source: Literal["deterministic", "llm", "none"] = "none"
+    verified_at: Optional[str] = None
+    evidence_url: Optional[str] = None
 
 
 class PlatformVerification(BaseModel):
@@ -101,6 +111,8 @@ class PlatformVerification(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
     stats: dict = Field(default_factory=dict)
+    verified_at: Optional[str] = None
+    evidence_url: Optional[str] = None
 
 
 class CandidateVerificationReport(BaseModel):
@@ -112,6 +124,7 @@ class CandidateVerificationReport(BaseModel):
     platform_verifications: list[dict] = Field(default_factory=list)
     skills_corroborated: list[str] = Field(default_factory=list)
     skills_unverifiable: list[str] = Field(default_factory=list)
+    red_flags: list[str] = Field(default_factory=list)
     summary: str
 
 
@@ -205,6 +218,8 @@ def verify_project(project: dict) -> dict:
             reasoning="No valid GitHub repo URL to verify against.",
             unmatched_claims=claimed_stack,
             evidence_source="none",
+            verified_at=_now_iso(),
+            evidence_url=url or None,
         ).model_dump()
         return project
 
@@ -225,6 +240,8 @@ def verify_project(project: dict) -> dict:
             reasoning="GitHub API rate-limited during verification — retry later.",
             unmatched_claims=claimed_stack,
             evidence_source="none",
+            verified_at=_now_iso(),
+            evidence_url=url,
         ).model_dump()
         return project
 
@@ -235,6 +252,8 @@ def verify_project(project: dict) -> dict:
             reasoning="The claimed GitHub repository does not exist or is private.",
             unmatched_claims=claimed_stack,
             evidence_source="deterministic",
+            verified_at=_now_iso(),
+            evidence_url=url,
         ).model_dump()
         return project
 
@@ -263,6 +282,8 @@ def verify_project(project: dict) -> dict:
             matched_tech=det_result["matched"],
             unmatched_claims=[],
             evidence_source="deterministic",
+            verified_at=_now_iso(),
+            evidence_url=url,
         )
         project["verification"] = verification.model_dump()
         cache_set(cache_key, verification.model_dump_json())
@@ -276,6 +297,8 @@ def verify_project(project: dict) -> dict:
                       "dependency evidence matching the claimed tech stack.",
             unmatched_claims=claimed_stack,
             evidence_source="deterministic",
+            verified_at=_now_iso(),
+            evidence_url=url,
         )
         project["verification"] = verification.model_dump()
         cache_set(cache_key, verification.model_dump_json())
@@ -303,6 +326,8 @@ def verify_project(project: dict) -> dict:
     result: ProjectVerification = structured_llm.invoke(prompt)
     result.evidence_source = "llm"
     result.matched_tech = list(set(result.matched_tech) | set(det_result["matched"]))
+    result.verified_at = _now_iso()
+    result.evidence_url = url
 
     project["verification"] = result.model_dump()
     cache_set(cache_key, result.model_dump_json())
@@ -325,6 +350,7 @@ def verify_codeforces_claim(handle: str, claimed_skills: Optional[list[str]] = N
     )
 
     profile = fetch_codeforces_profile(handle)
+    evidence_url = f"https://codeforces.com/profile/{handle}"
 
     if profile.get("error"):
         verdict = "unsupported" if claims_cp_skill else "insufficient_evidence"
@@ -333,6 +359,8 @@ def verify_codeforces_claim(handle: str, claimed_skills: Optional[list[str]] = N
             verdict=verdict,
             confidence=0.8 if claims_cp_skill else 0.3,
             reasoning=f"Codeforces handle '{handle}' could not be verified: {profile['error']}",
+            verified_at=_now_iso(),
+            evidence_url=evidence_url,
         ).model_dump()
 
     rating = profile.get("current_rating")
@@ -366,6 +394,8 @@ def verify_codeforces_claim(handle: str, claimed_skills: Optional[list[str]] = N
         confidence=confidence,
         reasoning=reasoning,
         stats={"current_rating": rating, "rank": rank, "solved": solved, "contests": contests},
+        verified_at=_now_iso(),
+        evidence_url=evidence_url,
     ).model_dump()
 
 
@@ -385,6 +415,7 @@ def verify_leetcode_claim(username: str, claimed_skills: Optional[list[str]] = N
     )
 
     profile = fetch_leetcode_profile(username)
+    evidence_url = f"https://leetcode.com/u/{username}/"
 
     if profile.get("error"):
         verdict = "unsupported" if claims_cp_skill else "insufficient_evidence"
@@ -393,10 +424,15 @@ def verify_leetcode_claim(username: str, claimed_skills: Optional[list[str]] = N
             verdict=verdict,
             confidence=0.8 if claims_cp_skill else 0.3,
             reasoning=f"LeetCode handle '{username}' could not be verified: {profile['error']}",
+            verified_at=_now_iso(),
+            evidence_url=evidence_url,
         ).model_dump()
 
     total = profile["solved"]["total"]
-    rating = profile["contest"]["rating"]
+    raw_rating = profile["contest"]["rating"]
+    # LeetCode's API returns high-precision floats (e.g. 1550.871432945877) —
+    # round for any human-facing report; stdlib round(), no extra deps.
+    rating = round(raw_rating, 1) if raw_rating is not None else None
 
     if total == 0:
         verdict, confidence, reasoning = (
@@ -422,7 +458,42 @@ def verify_leetcode_claim(username: str, claimed_skills: Optional[list[str]] = N
         confidence=confidence,
         reasoning=reasoning,
         stats={"total_solved": total, "contest_rating": rating},
+        verified_at=_now_iso(),
+        evidence_url=evidence_url,
     ).model_dump()
+
+
+# ============================================================
+# RED FLAGS — flat, skimmable discrepancy list
+# ============================================================
+def extract_red_flags(verified_projects: list[dict], platform_results: list[dict]) -> list[str]:
+    """
+    Pulls concrete, human-scannable discrepancies out of verification
+    results, instead of leaving them buried inside prose 'reasoning' text.
+    Intended for a recruiter-facing summary or UI badge list.
+    """
+    flags: list[str] = []
+
+    for p in verified_projects:
+        v = p.get("verification", {})
+        name = p.get("name", "Unnamed project")
+
+        if v.get("verdict") == "unsupported":
+            flags.append(f"{name}: verdict UNSUPPORTED — repository evidence does not back this claim.")
+        elif v.get("verdict") == "insufficient_evidence":
+            flags.append(f"{name}: could not be checked ({v.get('reasoning', 'no reason given')}).")
+
+        if v.get("unmatched_claims"):
+            flags.append(
+                f"{name}: claimed {', '.join(v['unmatched_claims'])} — "
+                f"not confirmed by repository evidence."
+            )
+
+    for pr in platform_results:
+        if pr["verdict"] in ("unsupported", "insufficient_evidence"):
+            flags.append(f"{pr['platform'].capitalize()}: {pr['reasoning']}")
+
+    return flags
 
 
 # ============================================================
@@ -442,9 +513,6 @@ def verify_candidate(profile: dict) -> dict:
     unsupported = sum(1 for p in verified_projects if p["verification"]["verdict"] == "unsupported")
     insufficient = sum(1 for p in verified_projects if p["verification"]["verdict"] == "insufficient_evidence")
 
-    # Collect weighted (verdict, weight) pairs across ALL evidence sources —
-    # GitHub projects count fully; platform checks count too, but only when
-    # they yielded a real verdict (not insufficient_evidence).
     weighted_scores = [_VERDICT_WEIGHT[p["verification"]["verdict"]]
                         for p in verified_projects
                         if p["verification"]["verdict"] in _VERDICT_WEIGHT]
@@ -475,6 +543,8 @@ def verify_candidate(profile: dict) -> dict:
     skills_corroborated = sorted(corroborated & all_claimed_skills)
     skills_unverifiable = sorted(all_claimed_skills - corroborated)
 
+    red_flags = extract_red_flags(verified_projects, platform_results)
+
     summary_parts = [
         f"{supported}/{len(verified_projects)} projects fully supported by GitHub evidence, "
         f"{partial} partially supported, {unsupported} unsupported"
@@ -494,6 +564,7 @@ def verify_candidate(profile: dict) -> dict:
         platform_verifications=platform_results,
         skills_corroborated=skills_corroborated,
         skills_unverifiable=skills_unverifiable,
+        red_flags=red_flags,
         summary=" ".join(summary_parts),
     )
 
