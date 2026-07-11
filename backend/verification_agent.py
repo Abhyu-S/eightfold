@@ -518,17 +518,26 @@ def verify_candidate(profile: dict) -> dict:
                         if p["verification"]["verdict"] in _VERDICT_WEIGHT]
 
     platform_results = []
-    claimed_skills = profile.get("skills", [])
+
+    # profile["skills"] is now [{"name": ..., "kind": ...}, ...] — extract
+    # plain name strings once here, so downstream verification functions
+    # (which only ever need to check keyword membership) don't need to
+    # know about the dict shape at all.
+    raw_skills = profile.get("skills", [])
+    if raw_skills and isinstance(raw_skills[0], dict):
+        claimed_skill_names = [s["name"] for s in raw_skills]
+    else:
+        claimed_skill_names = raw_skills  # backward-compat if ever a flat list
 
     if profile.get("codeforces_handle"):
-        cf_result = verify_codeforces_claim(profile["codeforces_handle"], claimed_skills)
+        cf_result = verify_codeforces_claim(profile["codeforces_handle"], claimed_skill_names)
         profile["codeforces_verification"] = cf_result
         platform_results.append(cf_result)
         if cf_result["verdict"] in _VERDICT_WEIGHT:
             weighted_scores.append(_VERDICT_WEIGHT[cf_result["verdict"]])
 
     if profile.get("leetcode_username"):
-        lc_result = verify_leetcode_claim(profile["leetcode_username"], claimed_skills)
+        lc_result = verify_leetcode_claim(profile["leetcode_username"], claimed_skill_names)
         profile["leetcode_verification"] = lc_result
         platform_results.append(lc_result)
         if lc_result["verdict"] in _VERDICT_WEIGHT:
@@ -536,7 +545,7 @@ def verify_candidate(profile: dict) -> dict:
 
     overall_confidence = round(sum(weighted_scores) / len(weighted_scores), 2) if weighted_scores else 0.0
 
-    all_claimed_skills = set(claimed_skills)
+    all_claimed_skills = set(claimed_skill_names)
     corroborated = set()
     for p in verified_projects:
         corroborated.update(p["verification"].get("matched_tech", []))
