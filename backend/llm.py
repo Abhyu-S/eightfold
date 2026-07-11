@@ -1,5 +1,9 @@
+# backend/llm.py
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+
+from backend.config import settings
+
 
 def get_llm(temperature: float = 0.0):
     if settings.LLM_PROVIDER == "groq":

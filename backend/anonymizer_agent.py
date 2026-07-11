@@ -14,10 +14,12 @@ import logging
 import os
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from pydantic import BaseModel, Field
+from typing import List
 from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
 
+from backend.llm import get_llm
 from backend.config import settings
 from backend.cache import cache_get, cache_set, _make_key
 
@@ -26,9 +28,6 @@ logger = logging.getLogger(__name__)
 
 # ── Feature Flag ──────────────────────────────────────────────────────────────
 USE_MOCK_DATA: bool = settings.USE_MOCK_DATA
-
-# ── Configure Gemini ──────────────────────────────────────────────────────────
-client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 
 # ============================================================
@@ -90,7 +89,7 @@ MOCK_ANONYMIZED_PROFILE = {
 # PII REDACTION
 # ============================================================
 
-REDACTION_PROMPT = """\
+REDACTION_PROMPT = """REDACTION_PROMPT = ""\
 You are a Privacy AI. Your ONLY job is to take raw resume text and return a \
 redacted version where ALL personally identifiable information is replaced.
 
@@ -105,141 +104,86 @@ REMOVE / REPLACE:
 - LinkedIn/social URLs → remove (but keep GitHub/Codeforces URLs)
 - Profile photos or physical descriptions → remove
 
-PRESERVE EXACTLY:
+PRESERVE EXACTLY — DO NOT MODIFY ANY CHARACTER WITHIN THESE, EVEN IF THEY \
+CONTAIN THE PERSON'S NAME OR A USERNAME THAT LOOKS LIKE THEIR NAME:
 - All technical skills, frameworks, languages
 - Project descriptions and tech stacks
 - Role titles and job achievements
-- GitHub repository URLs and Codeforces handles
+- GitHub repository URLs and Codeforces handles — copy them character-for-character, \
+including the username portion (e.g. github.com/johnsmith123 must stay EXACTLY \
+as github.com/johnsmith123, never github.com/[Name Redacted])
 - Certifications and their names
 - Duration of employment (months/years)
+
+CRITICAL RULE: Redaction only applies to standalone mentions of a person's real name \
+in running text (e.g. "John Smith is a software engineer..."). It NEVER applies to \
+substrings inside a URL, even if that substring resembles or matches the person's name. \
+A username in a URL is not the same thing as the person's name — leave every URL untouched.
 
 Return ONLY the redacted text. No extra commentary.
 """
 
 
 def redact_pii(raw_text: str) -> str:
-    """
-    Strip all PII from raw resume text using Gemini Flash.
-    Returns the redacted text string.
-    Results are cached by content hash.
-    """
     if USE_MOCK_DATA:
         return "[Name Redacted] is a software engineer with 5 years of experience..."
 
     if not raw_text or not raw_text.strip():
         return ""
 
-    # Check cache
     cache_key = f"redact_pii:{_make_key(raw_text)}"
     cached = cache_get(cache_key)
     if cached is not None:
         logger.info("PII redaction loaded from cache")
         return cached
 
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL_FLASH,
-        contents=[REDACTION_PROMPT, f"Resume text:\n---\n{raw_text}\n---"],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-        ),
-    )
-    redacted = response.text.strip()
+    llm = get_llm(temperature=0.0)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", REDACTION_PROMPT),
+        ("human", "Resume text:\n---\n{text}\n---"),
+    ])
+    response = (prompt | llm).invoke({"text": raw_text})
+    redacted = response.content.strip()
 
     cache_set(cache_key, redacted)
     logger.info("PII redacted: %d → %d chars", len(raw_text), len(redacted))
     return redacted
 
-
 # ============================================================
 # STRUCTURED EXTRACTION
 # ============================================================
 
-EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "skills": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "All technical skills, programming languages, frameworks, tools mentioned"
-        },
-        "years_of_experience": {
-            "type": "integer",
-            "description": "Total estimated years of professional experience"
-        },
-        "education": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "degree": {"type": "string"},
-                    "institution": {"type": "string", "description": "Use [University Redacted] if in redacted text"},
-                    "year": {"type": "integer"}
-                },
-                "required": ["degree"]
-            }
-        },
-        "work_history": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "role": {"type": "string"},
-                    "company": {"type": "string"},
-                    "duration_months": {"type": "integer"},
-                    "key_achievements": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    }
-                },
-                "required": ["role"]
-            }
-        },
-        "certifications": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "projects": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "tech_stack": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "url": {"type": "string", "description": "Project URL if listed (GitHub, etc.)"}
-                },
-                "required": ["name"]
-            }
-        },
-        "external_urls": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "type": {
-                        "type": "string",
-                        "description": "One of: github_profile, github_repo, codeforces, leetcode, portfolio, other"
-                    }
-                },
-                "required": ["url", "type"]
-            },
-            "description": "All external URLs found in the resume"
-        },
-        "github_username": {
-            "type": "string",
-            "description": "GitHub username extracted from profile URL. null if not found."
-        },
-        "codeforces_handle": {
-            "type": "string",
-            "description": "Codeforces handle extracted from profile URL. null if not found."
-        }
-    },
-    "required": ["skills", "projects", "external_urls"]
-}
+class EducationEntry(BaseModel):
+    degree: str
+    institution: Optional[str] = None
+    year: Optional[int] = None
+
+class WorkEntry(BaseModel):
+    role: str
+    company: Optional[str] = None
+    duration_months: Optional[int] = None
+    key_achievements: List[str] = Field(default_factory=list)
+
+class ProjectEntry(BaseModel):
+    name: str
+    description: Optional[str] = None
+    tech_stack: List[str] = Field(default_factory=list)
+    url: Optional[str] = None
+
+class ExternalUrl(BaseModel):
+    url: str
+    type: str  # github_profile | github_repo | codeforces | leetcode | portfolio | other
+
+class CandidateProfile(BaseModel):
+    skills: List[str]
+    years_of_experience: Optional[int] = None
+    education: List[EducationEntry] = Field(default_factory=list)
+    work_history: List[WorkEntry] = Field(default_factory=list)
+    certifications: List[str] = Field(default_factory=list)
+    projects: List[ProjectEntry]
+    external_urls: List[ExternalUrl]
+    github_username: Optional[str] = None
+    codeforces_handle: Optional[str] = None
 
 EXTRACTION_PROMPT = """\
 You are a Talent Data Extraction AI. Parse the following resume text into a \
@@ -305,18 +249,14 @@ def extract_structured_profile(text: str, pdf_links: list[str] = None) -> dict:
             links_section += f"- {link}\n"
         links_section += "\nUse these actual URLs in your extraction. Do NOT invent additional URLs."
 
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL_FLASH,
-        contents=[EXTRACTION_PROMPT, f"Resume text:\n---\n{text}\n---{links_section}"],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EXTRACTION_SCHEMA,
-            temperature=0.0,
-        ),
-    )
+    llm = get_llm(temperature=0.0)
+    structured_llm = llm.with_structured_output(CandidateProfile)
 
-    parsed = json.loads(response.text)
-    parsed["pii_removed"] = "[Redacted]" in text or "[redacted]" in text.lower()
+    result: CandidateProfile = structured_llm.invoke(
+        f"{EXTRACTION_PROMPT}\n\nResume text:\n---\n{text}\n---{links_section}"
+    )
+    parsed = result.model_dump()
+   parsed["pii_removed"] = "redacted" in text.lower()
 
     # Merge PDF-extracted links that the LLM might have missed
     if pdf_links:
