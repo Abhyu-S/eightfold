@@ -184,6 +184,7 @@ class CandidateProfile(BaseModel):
     external_urls: List[ExternalUrl]
     github_username: Optional[str] = None
     codeforces_handle: Optional[str] = None
+    leetcode_username: Optional[str] = None   
 
 EXTRACTION_PROMPT = """\
 You are a Talent Data Extraction AI. Parse the following resume text into a \
@@ -194,14 +195,16 @@ RULES:
 2. Extract ALL external URLs that are EXPLICITLY written in the resume text.
 3. For GitHub profile URLs like github.com/username, extract the username.
 4. For Codeforces URLs like codeforces.com/profile/handle, extract the handle.
-5. Estimate years_of_experience from work history dates.
-6. List all projects with their tech stacks and URLs.
-7. If information is missing, use null or empty arrays.
+5. For LeetCode URLs like leetcode.com/u/username, extract the username as leetcode_username.
+6. Estimate years_of_experience from work history dates.
+7. List all projects with their tech stacks and URLs.
+8. If information is missing, use null or empty arrays.
 
 CRITICAL: Do NOT invent, guess, or hallucinate any URLs, usernames, or handles.
 Only extract information that is EXPLICITLY present in the text.
 If there is no Codeforces URL in the text, set codeforces_handle to null.
 If there is no GitHub URL in the text, set github_username to null.
+If there is no LeetCode URL in the text, set leetcode_username to null.
 Do NOT make up URLs that are not in the text.
 
 Return ONLY the JSON object matching the schema.
@@ -256,28 +259,38 @@ def extract_structured_profile(text: str, pdf_links: list[str] = None) -> dict:
         f"{EXTRACTION_PROMPT}\n\nResume text:\n---\n{text}\n---{links_section}"
     )
     parsed = result.model_dump()
-   parsed["pii_removed"] = "redacted" in text.lower()
+    parsed["pii_removed"] = "redacted" in text.lower()
 
     # Merge PDF-extracted links that the LLM might have missed
     if pdf_links:
         existing_urls = {u.get("url", "") for u in parsed.get("external_urls", [])}
         for link in pdf_links:
+            link_type = _classify_url(link)
+
             if link not in existing_urls:
-                link_type = _classify_url(link)
                 parsed.setdefault("external_urls", []).append(
                     {"url": link, "type": link_type}
                 )
-                # Also set github_username / codeforces_handle if found
-                if link_type == "github_profile" and not parsed.get("github_username"):
-                    from backend.github_scraper import extract_github_username
-                    username = extract_github_username(link)
-                    if username:
-                        parsed["github_username"] = username
-                elif link_type == "codeforces" and not parsed.get("codeforces_handle"):
-                    from backend.codeforces_scraper import extract_codeforces_handle
-                    handle = extract_codeforces_handle(link)
-                    if handle:
-                        parsed["codeforces_handle"] = handle
+                existing_urls.add(link)
+
+            # Backfill username/handle fields independently of whether the
+            # URL was already present — the LLM sometimes lists the URL but
+            # misses the corresponding field.
+            if link_type == "github_profile" and not parsed.get("github_username"):
+                from backend.github_scraper import extract_github_username
+                username = extract_github_username(link)
+                if username:
+                    parsed["github_username"] = username
+            elif link_type == "codeforces" and not parsed.get("codeforces_handle"):
+                from backend.codeforces_scraper import extract_codeforces_handle
+                handle = extract_codeforces_handle(link)
+                if handle:
+                    parsed["codeforces_handle"] = handle
+            elif link_type == "leetcode" and not parsed.get("leetcode_username"):
+                from backend.leetcode_scraper import extract_leetcode_username
+                username = extract_leetcode_username(link)
+                if username:
+                 parsed["leetcode_username"] = username
 
     # Cache the result
     cache_set(cache_key, json.dumps(parsed, ensure_ascii=False))
