@@ -1,38 +1,40 @@
 """
 main.py
 -------
-FastAPI orchestrator for the AI Resume Screener.
-Single endpoint that runs the full pipeline:
-  PDF → Redact PII → Extract Profile → Scrape GitHub/Codeforces →
-  Embed → Score (deterministic) → Bias Check → Explain
+FastAPI backend for the AI Resume Screener (Next.js version).
+Endpoints:
+- /api/upload-candidate: Parse PDF, scrape, chunk, embed, store in memory.
+- /api/add-jd: Embed JD and store.
+- /api/match: Compare JD embeddings with all candidate chunks, score, and rank.
+- /api/reset: Clear in-memory DB.
 """
 
 import logging
-import re
 import uuid
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from backend.config import settings
 from backend.logger import get_logger
 from backend.pdf_parser import extract_text_from_pdf_bytes, extract_links_from_pdf_bytes
 from backend.anonymizer_agent import redact_pii, extract_structured_profile
-from backend.github_scraper import (
-    fetch_github_profile,
-    fetch_repo_code_signals,
-    extract_github_username,
-)
+from backend.github_scraper import fetch_github_profile, extract_github_username
 from backend.codeforces_scraper import fetch_codeforces_profile, extract_codeforces_handle
+from backend.leetcode_scraper import fetch_leetcode_profile, extract_leetcode_username
 from backend.scorer import compute_final_score
 from backend.explainer import generate_explanation
+from backend.chunking import chunk_profile
+from backend.embeddings import embed_texts, embed_text
 
 logger = get_logger(__name__)
 
 app = FastAPI(
     title="AI Resume Screener",
-    description="Bias-free, deterministic candidate evaluation with glass-box explainability.",
-    version="2.0.0",
+    description="Bias-free, deterministic candidate evaluation.",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -43,259 +45,246 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── IN-MEMORY VECTOR DB ───────────────────────────────────────────────────────
+class CandidateData:
+    def __init__(self, candidate_id: str, profile: dict, github_data: dict, codeforces_data: dict, leetcode_data: dict, chunks: list, chunk_embeddings: Any):
+        self.candidate_id = candidate_id
+        self.profile = profile
+        self.github_data = github_data
+        self.codeforces_data = codeforces_data
+        self.leetcode_data = leetcode_data
+        self.chunks = chunks
+        self.chunk_embeddings = chunk_embeddings  # Numpy array of shape (N, D)
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "message": "AI Resume Screener is operational."}
+VECTOR_DB = {
+    "candidates": {}, # candidate_id -> CandidateData
+    "jd_embs": {}     # jd_id -> (text, embedding)
+}
+
+# ── SCHEMAS ──────────────────────────────────────────────────────────────────
+class AddJDRequest(BaseModel):
+    jd_text: str
+    jd_id: str
+
+class MatchRequest(BaseModel):
+    jd_text: str
+    top_k: int = 10
+
+class MatchResult(BaseModel):
+    candidate_id: str
+    rank: int
+    match_score: float
+    final_score: float
+    verified_skills: List[str]
+    unverified_claims: List[str]
+    verification_rate: float
+    trajectory_score: float
+    explanation: str
+    top_language: Optional[str]
+    cf_rank: Optional[str]
+    cf_max_rating: Optional[int]
 
 
-def _detect_cp_requirement(jd_text: str) -> bool:
-    """Check if job description mentions competitive programming."""
-    cp_keywords = [
-        "competitive programming", "codeforces", "leetcode", "hackerrank",
-        "algorithmic", "data structures and algorithms", "dsa",
-        "problem solving", "competitive coder",
-    ]
-    jd_lower = jd_text.lower()
-    return any(kw in jd_lower for kw in cp_keywords)
-
-
-def _extract_all_urls(profile: dict) -> list[dict]:
-    """Collect all URLs from the extracted profile."""
-    urls = profile.get("external_urls", [])
-    for project in profile.get("projects", []):
-        url = project.get("url")
-        if url and not any(u["url"] == url for u in urls):
-            urls.append({"url": url, "type": "github_repo"})
-    return urls
-
-
-def _find_github_username(profile: dict) -> str | None:
-    """Find GitHub username from profile data."""
-    # Direct field
-    if profile.get("github_username"):
-        return profile["github_username"]
-    # From URLs
+# ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
+def _find_username(profile: dict, field_name: str, url_domain: str, extract_func) -> Optional[str]:
+    if profile.get(field_name):
+        return profile[field_name]
     for url_info in profile.get("external_urls", []):
         url = url_info.get("url", "")
-        if "github.com" in url:
-            username = extract_github_username(url)
+        if url_domain in url:
+            username = extract_func(url)
             if username:
                 return username
     return None
 
-
-def _find_codeforces_handle(profile: dict) -> str | None:
-    """Find Codeforces handle from profile data."""
-    if profile.get("codeforces_handle"):
-        return profile["codeforces_handle"]
-    for url_info in profile.get("external_urls", []):
-        url = url_info.get("url", "")
-        if "codeforces.com" in url:
-            handle = extract_codeforces_handle(url)
-            if handle:
-                return handle
-    return None
-
+def _detect_cp_requirement(jd_text: str) -> bool:
+    cp_keywords = ["competitive programming", "codeforces", "leetcode", "hackerrank", "algorithmic", "dsa"]
+    return any(kw in jd_text.lower() for kw in cp_keywords)
 
 def _collect_code_contents(github_data: dict) -> list[str]:
-    """Gather all fetched code file contents from GitHub data."""
     contents = []
+    if not github_data or github_data.get("error"):
+        return contents
     for repo_name, signals in github_data.get("code_signals", {}).items():
         for f in signals.get("code_files", []):
             content = f.get("content", "")
             if content.strip():
                 contents.append(content)
-        # Also include README as a signal
         readme = signals.get("readme")
         if readme:
             contents.append(readme)
     return contents
 
 
-@app.post("/api/evaluate")
-async def evaluate_candidate(
-    resume_pdf: UploadFile = File(...),
-    job_description: str = Form(...),
+# ── ENDPOINTS ─────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "AI Resume Screener is operational."}
+
+
+@app.post("/api/upload-candidate")
+async def upload_candidate(
+    resume: UploadFile = File(...),
+    github_username: str = Form(default=""),
+    codeforces_handle: str = Form(default=""),
+    leetcode_username: str = Form(default="")
 ):
-    """
-    Full pipeline evaluation of a candidate resume against a job description.
-
-    Returns deterministic scores, bias check results, and glass-box explanations.
-    """
     candidate_id = str(uuid.uuid4())[:8]
-    logger.info("=== Evaluating candidate %s ===", candidate_id)
+    logger.info("=== Uploading candidate %s ===", candidate_id)
 
-    # ── Step 1: Extract PDF text ─────────────────────────────────────────
-    pdf_bytes = await resume_pdf.read()
+    pdf_bytes = await resume.read()
     if not pdf_bytes:
         raise HTTPException(400, "Empty PDF file.")
 
     raw_text = extract_text_from_pdf_bytes(pdf_bytes)
-    if not raw_text.strip():
-        raise HTTPException(400, "Could not extract text from PDF.")
-
-    logger.info("Step 1: Extracted %d chars from PDF", len(raw_text))
-
-    # ── Step 1b: Extract hyperlinks from PDF annotations ─────────────────
     pdf_links = extract_links_from_pdf_bytes(pdf_bytes)
-    logger.info("Step 1b: Extracted %d hyperlinks from PDF: %s", len(pdf_links), pdf_links)
 
-    # ── Step 2: Extract structured profile from ORIGINAL text ────────────
-    original_profile = extract_structured_profile(raw_text, pdf_links=pdf_links)
-    logger.info("Step 2: Extracted profile with %d skills", len(original_profile.get("skills", [])))
-
-    # ── Step 3: Redact PII and extract from REDACTED text ────────────────
+    # Extract & Redact
     redacted_text = redact_pii(raw_text)
     redacted_profile = extract_structured_profile(redacted_text, pdf_links=pdf_links)
-    logger.info("Step 3: PII redacted, re-extracted profile")
 
-    # ── Step 4: Find external profiles ───────────────────────────────────
-    github_username = _find_github_username(original_profile)
-    codeforces_handle = _find_codeforces_handle(original_profile)
-    logger.info("Step 4: GitHub=%s, CF=%s", github_username, codeforces_handle)
+    # Resolve Usernames
+    gh_user = github_username or _find_username(redacted_profile, "github_username", "github.com", extract_github_username)
+    cf_user = codeforces_handle or _find_username(redacted_profile, "codeforces_handle", "codeforces.com", extract_codeforces_handle)
+    lc_user = leetcode_username or _find_username(redacted_profile, "leetcode_username", "leetcode.com", extract_leetcode_username)
 
-    # ── Step 5: Scrape GitHub ────────────────────────────────────────────
-    github_data = {"code_signals": {}, "verified_dependencies": [], "top_repos": []}
-    has_github = False
-    if github_username:
-        try:
-            github_data = fetch_github_profile(github_username)
-            has_github = not github_data.get("error")
-            logger.info("Step 5: GitHub fetched — %d repos, %d deps",
-                       len(github_data.get("top_repos", [])),
-                       len(github_data.get("verified_dependencies", [])))
-        except Exception as exc:
-            logger.warning("GitHub scraping failed: %s", exc)
-    else:
-        logger.info("Step 5: No GitHub username found, skipping")
+    # Scrape
+    github_data = fetch_github_profile(gh_user) if gh_user else None
+    codeforces_data = fetch_codeforces_profile(cf_user) if cf_user else None
+    leetcode_data = fetch_leetcode_profile(lc_user) if lc_user else None
 
-    # ── Step 6: Scrape Codeforces ────────────────────────────────────────
-    codeforces_data = None
-    if codeforces_handle:
-        try:
-            codeforces_data = fetch_codeforces_profile(codeforces_handle)
-            logger.info("Step 6: Codeforces fetched — rating=%s",
-                       codeforces_data.get("max_rating"))
-        except Exception as exc:
-            logger.warning("Codeforces scraping failed: %s", exc)
-    else:
-        logger.info("Step 6: No Codeforces handle found, skipping")
-
-    # ── Step 7: Collect code contents for embedding ──────────────────────
-    code_contents = _collect_code_contents(github_data)
-    logger.info("Step 7: Collected %d code content pieces for embedding", len(code_contents))
-
-    # ── Step 8: Compute deterministic score (on REDACTED profile) ────────
-    jd_requires_cp = _detect_cp_requirement(job_description)
-    claimed_skills = redacted_profile.get("skills", [])
-    verified_deps = github_data.get("verified_dependencies", [])
-    work_history = redacted_profile.get("work_history", [])
-
-    scoring_result = compute_final_score(
-        jd_text=job_description,
-        resume_text=redacted_text,
-        code_contents=code_contents,
-        claimed_skills=claimed_skills,
-        verified_deps=verified_deps,
-        work_history=work_history,
-        has_github_evidence=has_github,
+    # Chunking
+    chunks = chunk_profile(
+        candidate_id=candidate_id,
+        profile_dict=redacted_profile,
+        github_data=github_data,
         codeforces_data=codeforces_data,
-        jd_requires_cp=jd_requires_cp,
-    )
-    logger.info("Step 8: Score computed — final=%.4f", scoring_result.final_score)
-
-    # ── Step 9: Bias check — score on original vs redacted ───────────────
-    # Since we always score on redacted text, the score is already bias-free.
-    # For the demo: re-score on the original text (which has PII) and verify delta ≈ 0.
-    # The delta should be non-zero ONLY because embedding of PII text differs slightly.
-    original_scoring = compute_final_score(
-        jd_text=job_description,
-        resume_text=raw_text,  # Original text WITH PII
-        code_contents=code_contents,
-        claimed_skills=original_profile.get("skills", []),
-        verified_deps=verified_deps,
-        work_history=original_profile.get("work_history", []),
-        has_github_evidence=has_github,
-        codeforces_data=codeforces_data,
-        jd_requires_cp=jd_requires_cp,
+        leetcode_data=leetcode_data
     )
 
-    bias_delta = abs(scoring_result.final_score - original_scoring.final_score)
-    logger.info("Step 9: Bias check — redacted=%.4f, original=%.4f, delta=%.6f",
-               scoring_result.final_score, original_scoring.final_score, bias_delta)
+    # Embed Chunks
+    chunk_texts = [c.text for c in chunks]
+    chunk_embeddings = embed_texts(chunk_texts) if chunk_texts else None
 
-    # ── Step 10: Generate explanation ────────────────────────────────────
-    explanation = {}
-    try:
-        explanation = generate_explanation(
-            scoring_result=scoring_result,
-            jd_text=job_description,
-            github_data=github_data,
-            codeforces_data=codeforces_data,
-            work_history=work_history,
-        )
-        logger.info("Step 10: Explanation generated")
-    except Exception as exc:
-        logger.error("Explanation generation failed: %s", exc)
-        explanation = {
-            "pros": ["Score computed successfully"],
-            "cons": ["Detailed explanation unavailable"],
-            "summary": f"Candidate scored {scoring_result.final_score:.2f}/1.0 based on mathematical analysis.",
-            "skill_evidence": [],
-        }
+    # Store in Memory DB
+    VECTOR_DB["candidates"][candidate_id] = CandidateData(
+        candidate_id=candidate_id,
+        profile=redacted_profile,
+        github_data=github_data or {},
+        codeforces_data=codeforces_data or {},
+        leetcode_data=leetcode_data or {},
+        chunks=chunks,
+        chunk_embeddings=chunk_embeddings
+    )
 
-    # ── Build response ───────────────────────────────────────────────────
-    response = {
+    return {
         "candidate_id": candidate_id,
-        "final_score": scoring_result.final_score,
-        "final_score_pct": round(scoring_result.final_score * 100, 2),
-        "score_breakdown": scoring_result.component_breakdown,
-        "bias_check": {
-            "redacted_score": scoring_result.final_score,
-            "original_score": original_scoring.final_score,
-            "delta": round(bias_delta, 6),
-            "is_bias_free": bias_delta < 0.01,
-        },
-        "explanation": explanation,
-        "skills": {
-            "verified": scoring_result.verified_skills,
-            "unverified": scoring_result.unverified_skills,
-            "claimed_count": len(claimed_skills),
-            "verified_count": len(scoring_result.verified_skills),
-        },
-        "github_summary": {
-            "username": github_username,
-            "repos_analyzed": len(github_data.get("top_repos", [])),
-            "languages": github_data.get("language_distribution", {}),
-            "verified_deps": verified_deps[:20],
-            "top_repos": [
-                {"name": r["name"], "stars": r["stars"], "language": r["language"]}
-                for r in github_data.get("top_repos", [])[:5]
-            ],
-        },
-        "codeforces_summary": {
-            "handle": codeforces_handle,
-            "max_rating": codeforces_data.get("max_rating") if codeforces_data else None,
-            "rank": codeforces_data.get("rank") if codeforces_data else None,
-            "contests": codeforces_data.get("contests_participated", 0) if codeforces_data else 0,
-            "solved_approx": codeforces_data.get("solved_problems_approx", 0) if codeforces_data else 0,
-            "problem_distribution": codeforces_data.get("problem_rating_distribution", {}) if codeforces_data else {},
-        },
-        "profile": {
-            "skills": redacted_profile.get("skills", []),
-            "years_of_experience": redacted_profile.get("years_of_experience"),
-            "work_history": work_history,
-            "projects": redacted_profile.get("projects", []),
-            "certifications": redacted_profile.get("certifications", []),
-        },
+        "skills_found": len(redacted_profile.get("skills", []))
     }
 
-    logger.info("=== Evaluation complete for %s: %.2f%% ===", candidate_id, response["final_score_pct"])
-    return response
+
+@app.post("/api/add-jd")
+async def add_jd(req: AddJDRequest):
+    jd_emb = embed_text(req.jd_text)
+    VECTOR_DB["jd_embs"][req.jd_id] = (req.jd_text, jd_emb)
+    return {"status": "success", "jd_id": req.jd_id}
 
 
-# ── Run with uvicorn ─────────────────────────────────────────────────────────
+@app.post("/api/match", response_model=List[MatchResult])
+async def match_candidates(req: MatchRequest):
+    jd_text = req.jd_text
+    top_k = req.top_k
+
+    if not VECTOR_DB["candidates"]:
+        return []
+
+    jd_emb = embed_text(jd_text)
+    jd_requires_cp = _detect_cp_requirement(jd_text)
+
+    results = []
+    
+    for c_id, c_data in VECTOR_DB["candidates"].items():
+        # Match Score (Semantic Match using the best chunk vs JD)
+        # We can also compute evidence match here, but scorer.py expects the raw codes
+        code_contents = _collect_code_contents(c_data.github_data)
+        
+        # We'll use the existing deterministic scorer which does its own code embedding / text embedding comparison
+        # But wait, scorer.py embeds `resume_text`. We don't have a single `resume_text` anymore, we have chunks!
+        # To adapt `scorer.py` without rewriting it entirely, we can pass the concatenated chunks text as `resume_text`.
+        # Since `scorer.py` computes cosine sim on text, chunking is more for RAG retrieval but here we use it to construct the text.
+        combined_text = "\n\n".join([c.text for c in c_data.chunks])
+        
+        claimed_skills = [s.get('name') if isinstance(s, dict) else s for s in c_data.profile.get("skills", [])]
+        verified_deps = c_data.github_data.get("verified_dependencies", [])
+        work_history = c_data.profile.get("work_history", [])
+        has_github = not c_data.github_data.get("error", True) if c_data.github_data else False
+
+        scoring_result = compute_final_score(
+            jd_text=jd_text,
+            resume_text=combined_text,
+            code_contents=code_contents,
+            claimed_skills=claimed_skills,
+            verified_deps=verified_deps,
+            work_history=work_history,
+            has_github_evidence=has_github,
+            codeforces_data=c_data.codeforces_data,
+            jd_requires_cp=jd_requires_cp
+        )
+
+        explanation = generate_explanation(
+            scoring_result=scoring_result,
+            jd_text=jd_text,
+            github_data=c_data.github_data,
+            codeforces_data=c_data.codeforces_data,
+            work_history=work_history
+        )
+
+        # Map to Frontend Schema
+        total_claims = len(claimed_skills)
+        verified_count = len(scoring_result.verified_skills)
+        verification_rate = (verified_count / total_claims) if total_claims > 0 else 1.0
+        
+        # trajectory_score is just a synthetic metric derived from experience signal for the UI
+        trajectory_score = min(5, max(1, round(scoring_result.experience_signal * 5)))
+
+        top_lang = None
+        if c_data.github_data and c_data.github_data.get("language_distribution"):
+            langs = c_data.github_data.get("language_distribution")
+            if langs:
+                top_lang = list(langs.keys())[0]
+
+        results.append(MatchResult(
+            candidate_id=c_id,
+            rank=0, # assigned after sorting
+            match_score=scoring_result.semantic_match,
+            final_score=scoring_result.final_score,
+            verified_skills=scoring_result.verified_skills,
+            unverified_claims=scoring_result.unverified_skills,
+            verification_rate=verification_rate,
+            trajectory_score=trajectory_score,
+            explanation=explanation.get("summary", "Analysis completed."),
+            top_language=top_lang,
+            cf_rank=c_data.codeforces_data.get("rank") if c_data.codeforces_data else None,
+            cf_max_rating=c_data.codeforces_data.get("max_rating") if c_data.codeforces_data else None
+        ))
+
+    # Sort and rank
+    results.sort(key=lambda x: x.final_score, reverse=True)
+    results = results[:top_k]
+    
+    for i, r in enumerate(results):
+        r.rank = i + 1
+
+    return results
+
+
+@app.delete("/api/reset")
+async def reset_db():
+    VECTOR_DB["candidates"].clear()
+    VECTOR_DB["jd_embs"].clear()
+    return {"status": "success"}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.main:app", host="0.0.0.0", port=settings.APP_PORT, reload=True)
